@@ -1,9 +1,11 @@
 from datetime import datetime
 from html import escape
+import io
 import json
 import os
 import ssl
 import subprocess
+import zipfile
 from pathlib import Path
 from typing import Any, Dict, cast
 from urllib import error as urlerror
@@ -421,20 +423,26 @@ st.set_page_config(page_title="IEM Disease Prediction", layout="wide")
 load_local_env()
 
 st.title("IEM Disease Prediction Web App")
-st.write("Upload a CSV file to get top-3 disease predictions and a styled HTML report.")
+st.write("Upload one or more CSV files to get top-3 IEM disease predictions")
 
 with st.sidebar:
     st.header("Settings")
     model_path = st.text_input("Model path", value="comparisons/best_smote_balanced_lr.joblib")
     class_mapping_csv = st.text_input("Class mapping CSV", value="comparisons/class_mapping.csv")
-    id_column = st.text_input("ID column (optional)", value="")
+    id_column = st.text_input(
+        "ID column override (optional)",
+        value="",
+        help=(
+            "Leave blank for auto-detect (recommended). "
+            "Use this only if your sample ID column has a custom name."
+        ),
+    )
     default_webhook = get_discord_webhook()
     auto_send_discord = st.checkbox(
         "Auto-send suspected cases to Discord after prediction",
         value=False,
     )
     if default_webhook:
-        st.caption("Discord webhook loaded from Streamlit Secrets or env/.env.")
         if st.button("Send Test Ping to Discord"):
             try:
                 send_discord_message(default_webhook, "IEM app test ping from Streamlit sidebar.")
@@ -444,58 +452,87 @@ with st.sidebar:
     else:
         st.caption("Set DISCORD_WEBHOOK_URL in env/.env to enable Discord sending.")
 
-uploaded_file = st.file_uploader("Upload CSV", type=["csv"])
-run_btn = st.button("Run Prediction", type="primary", disabled=uploaded_file is None)
+uploaded_files = st.file_uploader("Upload CSV file(s)", type=["csv"], accept_multiple_files=True)
+run_btn = st.button("Run Prediction", type="primary", disabled=(not uploaded_files))
 
-if run_btn and uploaded_file is not None:
+if "keep_results_visible" not in st.session_state:
+    st.session_state["keep_results_visible"] = False
+
+if run_btn:
+    st.session_state["keep_results_visible"] = True
+
+if not uploaded_files:
+    st.session_state["keep_results_visible"] = False
+
+if (run_btn or st.session_state.get("keep_results_visible", False)) and uploaded_files:
     runs_dir = Path("comparisons") / "web_runs"
     runs_dir.mkdir(parents=True, exist_ok=True)
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    input_path = runs_dir / f"input_{ts}.csv"
-    output_csv = runs_dir / f"predictions_{ts}.csv"
-    output_html = runs_dir / f"report_{ts}.html"
-    suspected_html = runs_dir / f"suspected_report_{ts}.html"
-    suspected_png = runs_dir / f"suspected_report_{ts}.png"
-
-    input_path.write_bytes(uploaded_file.getvalue())
+    combined_output_csv = runs_dir / f"predictions_combined_{ts}.csv"
+    combined_suspected_html = runs_dir / f"suspected_report_combined_{ts}.html"
+    combined_suspected_png = runs_dir / f"suspected_report_combined_{ts}.png"
+    combined_html_zip = runs_dir / f"reports_{ts}.zip"
 
     try:
-        result = cast(Dict[str, Any], run_inference(
-            model_path=model_path,
-            input_csv=str(input_path),
-            output_csv=str(output_csv),
-            id_column=id_column.strip() or None,
-            class_mapping_csv=class_mapping_csv.strip() or None,
-            html_report=str(output_html),
-        ))
+        result_frames = []
+        html_reports: Dict[str, Path] = {}
+        total_rows = 0
 
-        st.success(
-            f"Prediction complete. Rows: {result['rows_predicted']}, "
-            f"Sample ID column: {result['id_column']}"
-        )
+        for idx, up in enumerate(uploaded_files):
+            input_path = runs_dir / f"input_{ts}_{idx}_{Path(up.name).stem}.csv"
+            output_csv = runs_dir / f"predictions_{ts}_{idx}_{Path(up.name).stem}.csv"
+            output_html = runs_dir / f"report_{ts}_{idx}_{Path(up.name).stem}.html"
+            input_path.write_bytes(up.getvalue())
 
-        df = cast(pd.DataFrame, result["results_df"])
-        id_col = str(result["id_column"])
-        if id_col not in df.columns:
-            id_col = "sample_id"
+            result = cast(Dict[str, Any], run_inference(
+                model_path=model_path,
+                input_csv=str(input_path),
+                output_csv=str(output_csv),
+                id_column=id_column.strip() or None,
+                class_mapping_csv=class_mapping_csv.strip() or None,
+                html_report=str(output_html),
+            ))
 
-        df = df.copy()
+            df_part = cast(pd.DataFrame, result["results_df"]).copy()
+            df_part["source_file"] = up.name
+            result_frames.append(df_part)
+            html_reports[up.name] = output_html
+            total_rows += int(result["rows_predicted"])
+
+        if not result_frames:
+            raise RuntimeError("No CSV files were processed.")
+
+        df = pd.concat(result_frames, axis=0, ignore_index=True)
+        id_col = "sample_id"
+
         df["is_flagged"] = ~df["top_1_disease"].astype(str).apply(is_normal_disease_name)
+        df["is_control"] = df[id_col].astype(str).apply(is_control_or_internal_sample)
         df["priority"] = df["is_flagged"].map({True: "FLAG", False: "NORMAL"})
 
         flagged_df = df[df["is_flagged"]].copy()
+        patient_flagged_df = get_patient_suspected_cases(df, id_col)
         normal_df = df[~df["is_flagged"]].copy()
-        prioritized_df = pd.concat([flagged_df, normal_df], axis=0).reset_index(drop=True)
+        # Group order: flagged patients -> control/internal samples -> normal patients
+        df["display_group"] = 2
+        df.loc[df["is_control"], "display_group"] = 1
+        df.loc[df["is_flagged"] & ~df["is_control"], "display_group"] = 0
+        prioritized_df = df.sort_values(by=["display_group"], ascending=[True], kind="stable").reset_index(drop=True)
+        prioritized_df.to_csv(combined_output_csv, index=False)
+
+        st.success(
+            f"Prediction complete for {len(uploaded_files)} file(s). "
+            f"Total rows: {total_rows}, Sample ID column: {id_col}"
+        )
 
         st.subheader("Priority Triage (Flagged Samples First)")
         c1, c2, c3 = st.columns(3)
         c1.metric("Total Samples", len(df))
-        c2.metric("Flagged (Disease)", len(flagged_df))
+        c2.metric("Flagged Patients (Disease)", len(patient_flagged_df))
         c3.metric("Normal/Other", len(normal_df))
 
-        if not flagged_df.empty:
-            flagged_ids = ", ".join(flagged_df[id_col].astype(str).tolist())
+        if not patient_flagged_df.empty:
+            flagged_ids = ", ".join(patient_flagged_df[id_col].astype(str).tolist())
             st.error(f"Priority sample IDs for doctor review: {flagged_ids}")
         else:
             st.success("No flagged disease samples detected in top-1 prediction.")
@@ -505,6 +542,7 @@ if run_btn and uploaded_file is not None:
             c
             for c in [
                 id_col,
+                "source_file",
                 "priority",
                 "top_1_disease",
                 "top_1_probability",
@@ -525,13 +563,14 @@ if run_btn and uploaded_file is not None:
             ] * len(row),
             axis=1,
         )
-        st.dataframe(styled, use_container_width=True)
+        st.dataframe(styled, width="stretch")
 
         suspected_only = prioritized_df[prioritized_df["is_flagged"]].copy()
         suspected_cols = [
             c
             for c in [
                 id_col,
+            "source_file",
                 "top_1_disease",
                 "top_1_probability",
                 "top_2_disease",
@@ -542,52 +581,60 @@ if run_btn and uploaded_file is not None:
             if c in suspected_only.columns
         ]
         suspected_csv_bytes = suspected_only[suspected_cols].to_csv(index=False).encode("utf-8")
-        suspected_html_path = build_suspected_html_report(prioritized_df, id_col, str(suspected_html))
+        suspected_html_path = build_suspected_html_report(prioritized_df, id_col, str(combined_suspected_html))
         suspected_png_path = None
         try:
-            suspected_png_path = build_suspected_png_report(prioritized_df, id_col, str(suspected_png))
+            suspected_png_path = build_suspected_png_report(prioritized_df, id_col, str(combined_suspected_png))
         except Exception as exc:
             st.warning(f"Could not build PNG report, using HTML for Discord attachment instead: {exc}")
 
         st.subheader("Report Preview (HTML Format)")
-        html_content = Path(output_html).read_text(encoding="utf-8")
+        preview_options = list(html_reports.keys())
+        preview_name = st.selectbox("Select file report to preview", options=preview_options)
+        html_content = Path(html_reports[preview_name]).read_text(encoding="utf-8")
         components.html(html_content, height=900, scrolling=True)
+
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+            for file_name, report_path in html_reports.items():
+                zf.write(report_path, arcname=f"{Path(file_name).stem}_report.html")
+        zip_buffer.seek(0)
 
         st.subheader("Downloads")
         st.download_button(
-            label="Download Predictions CSV",
-            data=Path(output_csv).read_bytes(),
-            file_name=output_csv.name,
+            label="Download Combined Predictions CSV",
+            data=Path(combined_output_csv).read_bytes(),
+            file_name=combined_output_csv.name,
             mime="text/csv",
         )
         st.download_button(
-            label="Download HTML Report",
-            data=Path(output_html).read_bytes(),
-            file_name=output_html.name,
-            mime="text/html",
+            label="Download All HTML Reports (ZIP)",
+            data=zip_buffer.getvalue(),
+            file_name=combined_html_zip.name,
+            mime="application/zip",
         )
         st.download_button(
-            label="Download Suspected Cases CSV",
+            label="Download Combined Suspected Cases CSV",
             data=suspected_csv_bytes,
-            file_name=f"suspected_cases_{ts}.csv",
+            file_name=f"suspected_cases_combined_{ts}.csv",
             mime="text/csv",
         )
         st.download_button(
-            label="Download Suspected Cases HTML",
+            label="Download Combined Suspected Cases HTML",
             data=Path(suspected_html_path).read_bytes(),
             file_name=Path(suspected_html_path).name,
             mime="text/html",
         )
         if suspected_png_path:
             st.download_button(
-                label="Download Suspected Cases PNG",
+                label="Download Combined Suspected Cases PNG",
                 data=Path(suspected_png_path).read_bytes(),
                 file_name=Path(suspected_png_path).name,
                 mime="image/png",
             )
 
         st.subheader("Discord")
-        if auto_send_discord and default_webhook:
+        if run_btn and auto_send_discord and default_webhook:
             try:
                 msg = build_discord_suspected_summary(prioritized_df, id_col)
                 send_discord_message(default_webhook, msg)
@@ -595,18 +642,18 @@ if run_btn and uploaded_file is not None:
                     send_discord_file_attachment(
                         default_webhook,
                         suspected_png_path,
-                        "Suspected-cases report attached (PNG image, patient only).",
+                        "Suspected-cases combined report attached (patient only).",
                         mime_type="image/png",
                     )
-                    st.success("Auto-sent suspected-cases summary + PNG attachment to Discord.")
+                    st.success("Auto-sent combined suspected-cases summary + PNG attachment to Discord.")
                 else:
                     send_discord_file_attachment(
                         default_webhook,
                         suspected_html_path,
-                        "Suspected-cases report attached (HTML fallback, patient only).",
+                        "Suspected-cases combined report attached (HTML fallback, patient only).",
                         mime_type="text/html",
                     )
-                    st.success("Auto-sent suspected-cases summary + HTML fallback attachment to Discord.")
+                    st.success("Auto-sent combined suspected-cases summary + HTML fallback attachment to Discord.")
             except urlerror.URLError as exc:
                 st.error(f"Discord network error during auto-send: {exc}")
             except Exception as exc:
@@ -624,18 +671,18 @@ if run_btn and uploaded_file is not None:
                     send_discord_file_attachment(
                         default_webhook,
                         suspected_png_path,
-                        "Suspected-cases report attached (PNG image, patient only).",
+                        "Suspected-cases combined report attached (patient only).",
                         mime_type="image/png",
                     )
-                    st.success("Sent suspected-cases summary + PNG attachment to Discord.")
+                    st.success("Sent combined suspected-cases summary + PNG attachment to Discord.")
                 else:
                     send_discord_file_attachment(
                         default_webhook,
                         suspected_html_path,
-                        "Suspected-cases report attached (HTML fallback, patient only).",
+                        "Suspected-cases combined report attached (HTML fallback, patient only).",
                         mime_type="text/html",
                     )
-                    st.success("Sent suspected-cases summary + HTML fallback attachment to Discord.")
+                    st.success("Sent combined suspected-cases summary + HTML fallback attachment to Discord.")
             except urlerror.URLError as exc:
                 st.error(f"Discord network error: {exc}")
             except Exception as exc:
