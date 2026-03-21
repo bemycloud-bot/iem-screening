@@ -1,0 +1,8 @@
+streamlit>=1.44,<2.0
+pandas>=2.2,<3.0
+numpy>=1.26,<3.0
+joblib>=1.4,<2.0
+scikit-learn>=1.5,<2.0
+imbalanced-learn>=0.13,<1.0
+matplotlib>=3.9,<4.0
+certifi>=2024.8.30
