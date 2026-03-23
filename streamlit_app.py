@@ -23,6 +23,56 @@ def is_normal_disease_name(name: str) -> bool:
     return text == "normal/other unspecified disease" or text.startswith("normal")
 
 
+def normalize_sample_id(value: Any) -> str:
+    text = str(value).strip()
+    if text.startswith('="') and text.endswith('"'):
+        return text[2:-1]
+    return text
+
+
+def parse_abnormal_markers(value: Any) -> list[str]:
+    if pd.isna(value):
+        return []
+
+    text = str(value).strip()
+    if not text:
+        return []
+
+    if ":" in text:
+        text = text.split(":", 1)[1]
+
+    return [marker.strip() for marker in text.split(";") if marker.strip()]
+
+
+def extract_top1_marker_and_value(row: pd.Series) -> tuple[str, str]:
+    markers = parse_abnormal_markers(row.get("Abnormals", ""))
+    if not markers:
+        return "-", "-"
+
+    marker_name = markers[0]
+    marker_value = row.get(marker_name, "-")
+    if pd.isna(marker_value) or str(marker_value).strip() == "":
+        marker_value_text = "-"
+    else:
+        marker_value_text = str(marker_value)
+
+    return marker_name, marker_value_text
+
+
+def build_marker_info_table(input_df: pd.DataFrame, source_id_col: str) -> pd.DataFrame:
+    marker_df = pd.DataFrame({"sample_id": input_df[source_id_col].map(normalize_sample_id)})
+
+    if "Abnormals" not in input_df.columns:
+        marker_df["top_1_marker"] = "-"
+        marker_df["top_1_marker_value"] = "-"
+        return marker_df
+
+    marker_pairs = input_df.apply(extract_top1_marker_and_value, axis=1)
+    marker_df["top_1_marker"] = [pair[0] for pair in marker_pairs]
+    marker_df["top_1_marker_value"] = [pair[1] for pair in marker_pairs]
+    return marker_df
+
+
 def load_local_env(env_path: str = ".env") -> None:
     """Load simple KEY=VALUE pairs from .env into process env if not already set."""
     if not os.path.exists(env_path):
@@ -161,8 +211,11 @@ def build_discord_suspected_summary(df: pd.DataFrame, id_col: str) -> str:
     ]
 
     for _, row in suspected.head(20).iterrows():
+        top_marker = str(row.get("top_1_marker", "-") or "-")
+        top_marker_value = str(row.get("top_1_marker_value", "-") or "-")
         lines.append(
             f"- {row[id_col]} | {row['top_1_disease']} | {row['top_1_probability']*100:.2f}%"
+            f" | Marker: {top_marker} = {top_marker_value}"
         )
 
     if len(suspected) > 20:
@@ -208,6 +261,8 @@ def build_suspected_html_report(df: pd.DataFrame, id_col: str, output_path: str)
             f"<td>{escape(str(row[id_col]))}</td>"
             f"<td>{escape(str(row.get('top_1_disease', '-')))}</td>"
             f"<td>{float(row.get('top_1_probability', 0.0)) * 100:.2f}%</td>"
+            f"<td>{escape(str(row.get('top_1_marker', '-')))}</td>"
+            f"<td>{escape(str(row.get('top_1_marker_value', '-')))}</td>"
             f"<td>{escape(str(row.get('top_2_disease', '-')))}</td>"
             f"<td>{float(row.get('top_2_probability', 0.0)) * 100:.2f}%</td>"
             f"<td>{escape(str(row.get('top_3_disease', '-')))}</td>"
@@ -284,6 +339,8 @@ def build_suspected_html_report(df: pd.DataFrame, id_col: str, output_path: str)
                     <th>Sample ID</th>
                     <th>Top 1 Disease</th>
                     <th>Top 1 Probability</th>
+                    <th>Top 1 Marker</th>
+                    <th>Marker Value</th>
                     <th>Top 2 Disease</th>
                     <th>Top 2 Probability</th>
                     <th>Top 3 Disease</th>
@@ -339,7 +396,7 @@ def build_suspected_png_report(df: pd.DataFrame, id_col: str, output_path: str) 
             "Disease Pattern Detection Report (Suspected Patient Cases Only)",
             ha="center",
             va="center",
-            fontsize=14,
+            fontsize=16,
             fontweight="bold",
             color="#1e8f4e",
         )
@@ -349,38 +406,36 @@ def build_suspected_png_report(df: pd.DataFrame, id_col: str, output_path: str) 
             "No suspected patient cases found.",
             ha="center",
             va="center",
-            fontsize=12,
+            fontsize=14,
             color="#18633a",
         )
-        ax.text(0.5, 0.15, f"Generated: {generated_at}", ha="center", va="center", fontsize=9, color="#666")
+        ax.text(0.5, 0.15, f"Generated: {generated_at}", ha="center", va="center", fontsize=10.5, color="#666")
         fig.savefig(output_path, dpi=220, bbox_inches="tight")
         plt.close(fig)
         return output_path
 
-    view = suspected[[id_col, "top_1_disease", "top_1_probability", "top_2_disease", "top_2_probability", "top_3_disease", "top_3_probability"]].copy()
+    view = suspected[[id_col, "top_1_disease", "top_1_probability", "top_1_marker", "top_1_marker_value"]].copy()
     view = view.rename(columns={
         id_col: "Sample ID",
         "top_1_disease": "Top 1 Disease",
         "top_1_probability": "Top 1 %",
-        "top_2_disease": "Top 2 Disease",
-        "top_2_probability": "Top 2 %",
-        "top_3_disease": "Top 3 Disease",
-        "top_3_probability": "Top 3 %",
+        "top_1_marker": "Top 1 Marker",
+        "top_1_marker_value": "Marker Value",
     })
 
-    for col in ["Top 1 %", "Top 2 %", "Top 3 %"]:
+    for col in ["Top 1 %"]:
         view[col] = view[col].astype(float).map(lambda v: f"{v * 100:.2f}%")
 
     max_rows = 20
     clipped = view.head(max_rows)
-    fig_h = max(4.5, 1.4 + (len(clipped) * 0.44))
-    fig, ax = plt.subplots(figsize=(20, fig_h))
+    fig_h = max(5.8, 1.8 + (len(clipped) * 0.58))
+    fig, ax = plt.subplots(figsize=(22, fig_h))
     ax.axis("off")
 
     title = "Disease Pattern Detection Report (Suspected Patient Cases Only)"
     ids = ", ".join(clipped["Sample ID"].astype(str).tolist())
-    ax.text(0.5, 1.08, title, ha="center", va="center", fontsize=16, fontweight="bold", color="#1e8f4e", transform=ax.transAxes)
-    ax.text(0.0, 1.01, f"Suspected patient sample IDs: {ids}", ha="left", va="center", fontsize=10, color="#8f1638", transform=ax.transAxes)
+    ax.text(0.5, 1.09, title, ha="center", va="center", fontsize=19, fontweight="bold", color="#1e8f4e", transform=ax.transAxes)
+    ax.text(0.0, 1.02, f"Suspected patient sample IDs: {ids}", ha="left", va="center", fontsize=12, color="#8f1638", transform=ax.transAxes)
 
     table = ax.table(
         cellText=clipped.values,
@@ -390,8 +445,8 @@ def build_suspected_png_report(df: pd.DataFrame, id_col: str, output_path: str) 
         bbox=[0, 0.02, 1, 0.94],
     )
     table.auto_set_font_size(False)
-    table.set_fontsize(8.5)
-    table.scale(1.0, 1.18)
+    table.set_fontsize(11)
+    table.scale(1.08, 1.45)
 
     n_cols = len(clipped.columns)
     for c in range(n_cols):
@@ -412,7 +467,7 @@ def build_suspected_png_report(df: pd.DataFrame, id_col: str, output_path: str) 
     footer = f"Generated: {generated_at}"
     if len(view) > max_rows:
         footer += f" | Showing first {max_rows} of {len(view)} suspected patient rows"
-    ax.text(0.0, -0.02, footer, ha="left", va="top", fontsize=8.5, color="#666", transform=ax.transAxes)
+    ax.text(0.0, -0.02, footer, ha="left", va="top", fontsize=10.5, color="#666", transform=ax.transAxes)
 
     fig.savefig(output_path, dpi=220, bbox_inches="tight")
     plt.close(fig)
@@ -495,6 +550,17 @@ if (run_btn or st.session_state.get("keep_results_visible", False)) and uploaded
             ))
 
             df_part = cast(pd.DataFrame, result["results_df"]).copy()
+            source_id_col = str(result.get("source_id_column", "")).strip()
+            input_df = pd.read_csv(input_path)
+            if source_id_col and source_id_col in input_df.columns:
+                marker_info_df = build_marker_info_table(input_df, source_id_col)
+                df_part = df_part.merge(marker_info_df, on="sample_id", how="left")
+            else:
+                df_part["top_1_marker"] = "-"
+                df_part["top_1_marker_value"] = "-"
+
+            df_part["top_1_marker"] = df_part["top_1_marker"].fillna("-").astype(str)
+            df_part["top_1_marker_value"] = df_part["top_1_marker_value"].fillna("-").astype(str)
             df_part["source_file"] = up.name
             result_frames.append(df_part)
             html_reports[up.name] = output_html
@@ -546,6 +612,8 @@ if (run_btn or st.session_state.get("keep_results_visible", False)) and uploaded
                 "priority",
                 "top_1_disease",
                 "top_1_probability",
+                "top_1_marker",
+                "top_1_marker_value",
                 "top_2_disease",
                 "top_2_probability",
                 "top_3_disease",
@@ -573,6 +641,8 @@ if (run_btn or st.session_state.get("keep_results_visible", False)) and uploaded
             "source_file",
                 "top_1_disease",
                 "top_1_probability",
+                "top_1_marker",
+                "top_1_marker_value",
                 "top_2_disease",
                 "top_2_probability",
                 "top_3_disease",
